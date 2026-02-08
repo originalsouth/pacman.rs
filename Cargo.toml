@@ -1,0 +1,13 @@
+[package]
+name = "pacman_game"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.27"
+rand = "0.8"
+unicode-width = "0.1"
+
+[[bin]]
+name = "pacman"
+path = "src/main.rs"
