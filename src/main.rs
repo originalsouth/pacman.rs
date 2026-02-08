@@ -11,8 +11,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
-const DEFAULT_GRID_W: usize = 31;
-const DEFAULT_GRID_H: usize = 21;
 const PEN_W: usize = 9;
 const PEN_H: usize = 5;
 const GHOST_RELEASE_INTERVAL: u32 = 90;
@@ -29,6 +27,10 @@ const BRAID_CHANCE: f32 = 0.45;
 const EXTRA_OPENINGS: f32 = 0.08;
 const INPUT_HOLD_MS: u64 = 160;
 const GHOST_MOVE_INTERVAL: u32 = 2;
+const MIN_GRID_W: usize = 21;
+const MIN_GRID_H: usize = 15;
+const DEFAULT_GRID_W: usize = 31;
+const DEFAULT_GRID_H: usize = 21;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tile {
@@ -278,22 +280,31 @@ impl Renderer {
 
 fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
+    let fullscreen = read_fullscreen_setting();
     terminal::enable_raw_mode()?;
-    stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(Hide)?;
+    if fullscreen {
+        stdout.execute(EnterAlternateScreen)?;
+        stdout.execute(Hide)?;
+    }
 
     let result = run(&mut stdout);
 
-    stdout.execute(Show)?;
-    stdout.execute(LeaveAlternateScreen)?;
+    if fullscreen {
+        stdout.execute(Show)?;
+        stdout.execute(LeaveAlternateScreen)?;
+    }
     terminal::disable_raw_mode()?;
     result
 }
 
 fn run(stdout: &mut Stdout) -> io::Result<()> {
     let mut rng = rand::thread_rng();
-    let grid_w = DEFAULT_GRID_W;
-    let grid_h = DEFAULT_GRID_H;
+    let full_maze = read_fullmaze_setting();
+    let (grid_w, grid_h) = if full_maze {
+        current_grid_size()?
+    } else {
+        (DEFAULT_GRID_W, DEFAULT_GRID_H)
+    };
     let mut game = new_game(&mut rng, 1, grid_w, grid_h);
     let mut last_tick = Instant::now();
     let mut last_seen: [Option<Instant>; 4] = [None, None, None, None];
@@ -337,13 +348,13 @@ fn run(stdout: &mut Stdout) -> io::Result<()> {
             let desired_dir = active_dir_recent(&last_seen, last_pressed);
             let input_active = desired_dir.is_some();
             tick(&mut game, &mut rng, desired_dir, input_active);
-            render(stdout, &mut game, &mut renderer)?;
+            render(stdout, &mut game, &mut renderer, full_maze)?;
             if game.lives == 0 {
-                render_game_over(stdout, &game)?;
+                render_game_over(stdout, &game, full_maze)?;
                 return Ok(());
             }
         } else {
-            render(stdout, &mut game, &mut renderer)?;
+            render(stdout, &mut game, &mut renderer, full_maze)?;
         }
 
         let elapsed = frame_start.elapsed();
@@ -365,6 +376,49 @@ fn read_speed_settings() -> (u64, u64) {
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_RENDER_FPS);
     (tick_ms, render_fps)
+}
+
+fn read_fullscreen_setting() -> bool {
+    std::env::var("PACMAN_FULLSCREEN")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true)
+}
+
+fn read_fullmaze_setting() -> bool {
+    std::env::var("PACMAN_FULL_MAZE")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(false)
+}
+
+fn current_grid_size() -> io::Result<(usize, usize)> {
+    let (term_w, term_h) = terminal::size()?;
+    let mut w = (term_w as usize) / CELL_W;
+    let mut h = term_h as usize;
+    if h > 2 {
+        h -= 2;
+    } else {
+        h = 1;
+    }
+
+    if w < MIN_GRID_W {
+        w = MIN_GRID_W;
+    }
+    if h < MIN_GRID_H {
+        h = MIN_GRID_H;
+    }
+
+    if w % 2 == 0 {
+        w = w.saturating_sub(1);
+    }
+    if h % 2 == 0 {
+        h = h.saturating_sub(1);
+    }
+
+    Ok((w, h))
 }
 
 fn new_game(rng: &mut impl Rng, level: u32, width: usize, height: usize) -> Game {
@@ -452,7 +506,20 @@ fn tick(game: &mut Game, rng: &mut impl Rng, desired_dir: Option<Dir>, input_act
     game.handle_collisions(rng);
 }
 
-fn render(stdout: &mut Stdout, game: &mut Game, renderer: &mut Renderer) -> io::Result<()> {
+fn render(
+    stdout: &mut Stdout,
+    game: &mut Game,
+    renderer: &mut Renderer,
+    full_maze: bool,
+) -> io::Result<()> {
+    if full_maze {
+        let (new_w, new_h) = current_grid_size()?;
+        if new_w != game.width || new_h != game.height {
+            *game = new_game(&mut rand::thread_rng(), 1, new_w, new_h);
+            *renderer = Renderer::new(new_w, new_h);
+        }
+    }
+
     let needed_h = (game.height + 2) as u16;
     let needed_w = (game.width * CELL_W) as u16;
 
@@ -471,8 +538,11 @@ fn render(stdout: &mut Stdout, game: &mut Game, renderer: &mut Renderer) -> io::
         return Ok(());
     }
 
-    let origin_x = (term_w - needed_w) / 2;
-    let origin_y = (term_h - needed_h) / 2 + 1;
+    let (origin_x, origin_y) = if full_maze {
+        (0, 1)
+    } else {
+        ((term_w - needed_w) / 2, (term_h - needed_h) / 2 + 1)
+    };
     if origin_x != renderer.origin_x || origin_y != renderer.origin_y {
         renderer.origin_x = origin_x;
         renderer.origin_y = origin_y;
@@ -585,15 +655,18 @@ fn draw_cell(stdout: &mut Stdout, renderer: &Renderer, x: usize, y: usize, cell:
     Ok(())
 }
 
-fn render_game_over(stdout: &mut Stdout, game: &Game) -> io::Result<()> {
+fn render_game_over(stdout: &mut Stdout, game: &Game, full_maze: bool) -> io::Result<()> {
     let (term_w, term_h) = terminal::size()?;
     let needed_h = (game.height + 2) as u16;
     let needed_w = (game.width * CELL_W) as u16;
     if term_w < needed_w || term_h < needed_h {
         stdout.queue(MoveTo(0, needed_h))?;
     } else {
-        let origin_x = (term_w - needed_w) / 2;
-        let origin_y = (term_h - needed_h) / 2 + 1;
+        let (origin_x, origin_y) = if full_maze {
+            (0, 1)
+        } else {
+            ((term_w - needed_w) / 2, (term_h - needed_h) / 2 + 1)
+        };
         stdout.queue(MoveTo(origin_x, origin_y + game.height as u16))?;
     }
     stdout.queue(Print(format!(
