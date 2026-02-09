@@ -8,6 +8,7 @@ A fast, full‑screen, terminal‑only Pac‑Man clone written in Rust. It rende
 - Smooth 120 FPS rendering (configurable)
 - Randomized, fully connected maze with loops
 - Classic ghost pen with a gate and staggered releases
+- Ghosts speed up each level
 - Bonus treats that spawn occasionally
 - Vim‑style movement (`h`, `j`, `k`, `l`)
 
@@ -39,15 +40,20 @@ PACMAN_TICK_MS=70 PACMAN_FPS=120 cargo run --bin pacman
 
 - `PACMAN_TICK_MS`: movement tick (lower = faster)
 - `PACMAN_FPS`: render rate
+- `PACMAN_INPUT`: input scheme (`vi` default, `arrow`, or `gamer`/`wasd`)
 - `PACMAN_FULLSCREEN`: set to `0` to disable alternate‑screen fullscreen
 - `PACMAN_FULL_MAZE`: set to `1` to scale the maze to your terminal size (regenerates on resize)
 
 Additional gameplay constants are in `src/main.rs`:
 
-- `GHOST_MOVE_INTERVAL` (ghost speed)
+- `GHOST_MOVE_INTERVAL_BASE` (starting ghost speed)
+- `GHOST_MOVE_INTERVAL_MIN` (fastest allowed ghost speed)
+- `GHOST_SPEED_LEVEL_SCALE` (speed increase per level)
 - `PEN_W`, `PEN_H` (ghost pen size)
 - `GHOST_RELEASE_INTERVAL`
 - `BONUS_*` (bonus treat behavior)
+
+Ghosts move faster every level by scaling the move interval using the constants above.
 
 ## Notes
 

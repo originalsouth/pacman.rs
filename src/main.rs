@@ -26,7 +26,9 @@ const DEFAULT_RENDER_FPS: u64 = 120;
 const BRAID_CHANCE: f32 = 0.45;
 const EXTRA_OPENINGS: f32 = 0.08;
 const INPUT_HOLD_MS: u64 = 160;
-const GHOST_MOVE_INTERVAL: u32 = 2;
+const GHOST_MOVE_INTERVAL_BASE: f32 = 2.0;
+const GHOST_MOVE_INTERVAL_MIN: f32 = 0.7;
+const GHOST_SPEED_LEVEL_SCALE: f32 = 0.08;
 const MIN_GRID_W: usize = 21;
 const MIN_GRID_H: usize = 15;
 const DEFAULT_GRID_W: usize = 31;
@@ -66,6 +68,56 @@ impl Dir {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum InputScheme {
+    Vi,
+    Arrow,
+    Gamer,
+}
+
+fn read_input_scheme() -> InputScheme {
+    match std::env::var("PACMAN_INPUT")
+        .ok()
+        .map(|v| v.to_lowercase())
+        .as_deref()
+    {
+        Some("arrow") | Some("arrows") => InputScheme::Arrow,
+        Some("gamer") | Some("wasd") => InputScheme::Gamer,
+        _ => InputScheme::Vi,
+    }
+}
+
+fn map_key_dir(scheme: InputScheme, code: KeyCode) -> Option<Dir> {
+    match scheme {
+        InputScheme::Vi => match code {
+            KeyCode::Char('k') => Some(Dir::Up),
+            KeyCode::Char('j') => Some(Dir::Down),
+            KeyCode::Char('h') => Some(Dir::Left),
+            KeyCode::Char('l') => Some(Dir::Right),
+            _ => None,
+        },
+        InputScheme::Arrow => match code {
+            KeyCode::Up => Some(Dir::Up),
+            KeyCode::Down => Some(Dir::Down),
+            KeyCode::Left => Some(Dir::Left),
+            KeyCode::Right => Some(Dir::Right),
+            _ => None,
+        },
+        InputScheme::Gamer => match code {
+            KeyCode::Char('w') => Some(Dir::Up),
+            KeyCode::Char('s') => Some(Dir::Down),
+            KeyCode::Char('a') => Some(Dir::Left),
+            KeyCode::Char('d') => Some(Dir::Right),
+            _ => None,
+        },
+    }
+}
+
+fn ghost_move_interval(level: u32) -> f32 {
+    let scale = 1.0 + (level.saturating_sub(1) as f32) * GHOST_SPEED_LEVEL_SCALE;
+    (GHOST_MOVE_INTERVAL_BASE / scale).max(GHOST_MOVE_INTERVAL_MIN)
+}
+
 struct Game {
     width: usize,
     height: usize,
@@ -80,7 +132,7 @@ struct Game {
     pellets_left: usize,
     power_timer: u32,
     dir: Option<Dir>,
-    ghost_tick: u32,
+    ghost_timer: f32,
     ghost_release: Vec<u32>,
     pen_bounds: PenBounds,
     bonus_pos: Option<Pos>,
@@ -158,33 +210,46 @@ impl Game {
     }
 
     fn update_ghosts(&mut self, rng: &mut impl Rng) {
-        self.ghost_tick = self.ghost_tick.wrapping_add(1);
-        if self.ghost_tick % GHOST_MOVE_INTERVAL != 0 {
+        let interval = ghost_move_interval(self.level);
+        self.ghost_timer += 1.0;
+        if self.ghost_timer < interval {
             return;
         }
-        let dist = bfs_distance(&self.grid, self.width, self.height, self.player, true);
-        for (idx, ghost) in self.ghosts.iter_mut().enumerate() {
-            if self.ghost_release[idx] > 0 {
-                self.ghost_release[idx] = self.ghost_release[idx].saturating_sub(1);
-                let dir = ghost_next_dir_pen(
-                    *ghost,
-                    &self.grid,
-                    self.width,
-                    self.height,
-                    &self.pen_bounds,
-                    rng,
-                );
-                if let Some(dir) = dir {
-                    *ghost = step(*ghost, dir);
+
+        let mut moves = 0;
+        while self.ghost_timer >= interval {
+            self.ghost_timer -= interval;
+            moves += 1;
+        }
+
+        for _ in 0..moves {
+            let dist = bfs_distance(&self.grid, self.width, self.height, self.player, true);
+            for (idx, ghost) in self.ghosts.iter_mut().enumerate() {
+                if self.ghost_release[idx] > 0 {
+                    self.ghost_release[idx] = self.ghost_release[idx].saturating_sub(1);
+                    let dir = ghost_next_dir_pen(
+                        *ghost,
+                        &self.grid,
+                        self.width,
+                        self.height,
+                        &self.pen_bounds,
+                        rng,
+                    );
+                    if let Some(dir) = dir {
+                        *ghost = step(*ghost, dir);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let dir =
-                ghost_next_dir(*ghost, &self.grid, self.width, self.height, &dist, rng, true);
+            let dir = if self.power_timer > 0 {
+                ghost_next_dir_flee(*ghost, &self.grid, self.width, self.height, &dist, rng, true)
+            } else {
+                ghost_next_dir(*ghost, &self.grid, self.width, self.height, &dist, rng, true)
+            };
             if let Some(dir) = dir {
                 *ghost = step(*ghost, dir);
             }
         }
+    }
     }
 
     fn tick_power_timer(&mut self) {
@@ -300,6 +365,7 @@ fn main() -> io::Result<()> {
 fn run(stdout: &mut Stdout) -> io::Result<()> {
     let mut rng = rand::thread_rng();
     let full_maze = read_fullmaze_setting();
+    let input_scheme = read_input_scheme();
     let (grid_w, grid_h) = if full_maze {
         current_grid_size()?
     } else {
@@ -318,26 +384,21 @@ fn run(stdout: &mut Stdout) -> io::Result<()> {
         while event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
                 match key.kind {
-                    KeyEventKind::Press | KeyEventKind::Repeat => match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char('k') => {
-                            last_seen[0] = Some(Instant::now());
-                            last_pressed = Some(Dir::Up);
+                    KeyEventKind::Press | KeyEventKind::Repeat => {
+                        if key.code == KeyCode::Char('q') {
+                            return Ok(());
                         }
-                        KeyCode::Char('j') => {
-                            last_seen[1] = Some(Instant::now());
-                            last_pressed = Some(Dir::Down);
+                        if let Some(dir) = map_key_dir(input_scheme, key.code) {
+                            let idx = match dir {
+                                Dir::Up => 0,
+                                Dir::Down => 1,
+                                Dir::Left => 2,
+                                Dir::Right => 3,
+                            };
+                            last_seen[idx] = Some(Instant::now());
+                            last_pressed = Some(dir);
                         }
-                        KeyCode::Char('h') => {
-                            last_seen[2] = Some(Instant::now());
-                            last_pressed = Some(Dir::Left);
-                        }
-                        KeyCode::Char('l') => {
-                            last_seen[3] = Some(Instant::now());
-                            last_pressed = Some(Dir::Right);
-                        }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -452,7 +513,7 @@ fn new_game(rng: &mut impl Rng, level: u32, width: usize, height: usize) -> Game
         pellets_left,
         power_timer: 0,
         dir: None,
-        ghost_tick: 0,
+        ghost_timer: 0.0,
         ghost_release,
         pen_bounds,
         bonus_pos: None,
@@ -483,7 +544,7 @@ fn next_level(game: &mut Game, rng: &mut impl Rng) {
     game.pen_bounds = pen_bounds;
     game.power_timer = 0;
     game.dir = None;
-    game.ghost_tick = 0;
+    game.ghost_timer = 0.0;
     game.bonus_pos = None;
     game.bonus_timer = 0;
     game.bonus_spawn_in = rng.gen_range(BONUS_MIN_TICKS..=BONUS_MAX_TICKS);
@@ -586,16 +647,23 @@ fn cell_for(game: &Game, pos: Pos) -> Cell {
             color: Color::Yellow,
         };
     }
-    if game.ghosts.iter().any(|g| *g == pos) {
+    if let Some((idx, _)) = game.ghosts.iter().enumerate().find(|(_, g)| **g == pos) {
         if game.power_timer > 0 {
             return Cell {
                 glyph: Glyph::Frightened,
                 color: Color::Blue,
             };
         }
+        let ghost_colors = [
+            Color::Red,                  // Blinky
+            Color::Magenta,              // Pinky
+            Color::Cyan,                 // Inky
+            Color::DarkYellow,           // Clyde
+        ];
+        let color = ghost_colors[idx % ghost_colors.len()];
         return Cell {
             glyph: Glyph::Ghost,
-            color: Color::Red,
+            color,
         };
     }
     if game.bonus_pos == Some(pos) {
@@ -629,10 +697,10 @@ fn cell_for(game: &Game, pos: Pos) -> Cell {
 }
 
 fn draw_cell(stdout: &mut Stdout, renderer: &Renderer, x: usize, y: usize, cell: Cell) -> io::Result<()> {
-    let (text, color) = match cell.glyph {
+    let (text, fg_color) = match cell.glyph {
         Glyph::Player => ("😃", cell.color),
-        Glyph::Ghost => ("👻", cell.color),
-        Glyph::Frightened => ("😱", cell.color),
+        Glyph::Ghost => ("👻", Color::Reset),
+        Glyph::Frightened => ("😱", Color::Reset),
         Glyph::Wall => ("██", cell.color),
         Glyph::Empty => ("  ", cell.color),
         Glyph::Pellet => ("· ", cell.color),
@@ -643,7 +711,7 @@ fn draw_cell(stdout: &mut Stdout, renderer: &Renderer, x: usize, y: usize, cell:
     let x_pos = renderer.origin_x + (x * CELL_W) as u16;
     let y_pos = renderer.origin_y + y as u16;
     stdout.queue(MoveTo(x_pos, y_pos))?;
-    stdout.queue(SetForegroundColor(color))?;
+    stdout.queue(SetForegroundColor(fg_color))?;
     stdout.queue(Print(text))?;
     let w = UnicodeWidthStr::width(text);
     if w < CELL_W {
@@ -828,6 +896,38 @@ fn ghost_next_dir(
         let next = step(pos, dir);
         let d = dist[next.y][next.x];
         if d >= 0 && d < best {
+            best = d;
+            options.clear();
+            options.push(dir);
+        } else if d >= 0 && d == best {
+            options.push(dir);
+        }
+    }
+    if options.is_empty() {
+        None
+    } else {
+        Some(*options.choose(rng).unwrap())
+    }
+}
+
+fn ghost_next_dir_flee(
+    pos: Pos,
+    grid: &[Vec<Tile>],
+    width: usize,
+    height: usize,
+    dist: &[Vec<i32>],
+    rng: &mut impl Rng,
+    gate_open: bool,
+) -> Option<Dir> {
+    let mut options = Vec::new();
+    let mut best = -1;
+    for dir in [Dir::Up, Dir::Down, Dir::Left, Dir::Right] {
+        if !can_move_ghost(grid, width, height, pos, dir, gate_open) {
+            continue;
+        }
+        let next = step(pos, dir);
+        let d = dist[next.y][next.x];
+        if d >= 0 && d > best {
             best = d;
             options.clear();
             options.push(dir);
@@ -1230,25 +1330,35 @@ fn ghost_next_dir_pen(
 }
 
 fn random_bonus_spawn(game: &Game, rng: &mut impl Rng) -> Option<Pos> {
-    let mut candidates = Vec::new();
+    let mut empty_candidates = Vec::new();
+    let mut pellet_candidates = Vec::new();
     for y in 1..game.height - 1 {
         for x in 1..game.width - 1 {
-            if game.grid[y][x] == Tile::Empty {
-                let pos = Pos { x, y };
-                if is_in_pen(pos, game.width, game.height) {
-                    continue;
-                }
-                if game.player == pos {
-                    continue;
-                }
-                if game.ghosts.iter().any(|g| *g == pos) {
-                    continue;
-                }
-                candidates.push(pos);
+            let tile = game.grid[y][x];
+            if tile != Tile::Empty && tile != Tile::Pellet && tile != Tile::Power {
+                continue;
+            }
+            let pos = Pos { x, y };
+            if is_in_pen(pos, game.width, game.height) {
+                continue;
+            }
+            if game.player == pos {
+                continue;
+            }
+            if game.ghosts.iter().any(|g| *g == pos) {
+                continue;
+            }
+            if tile == Tile::Empty {
+                empty_candidates.push(pos);
+            } else {
+                pellet_candidates.push(pos);
             }
         }
     }
-    candidates.choose(rng).copied()
+    if !empty_candidates.is_empty() {
+        return empty_candidates.choose(rng).copied();
+    }
+    pellet_candidates.choose(rng).copied()
 }
 
 fn braid_maze(grid: &mut [Vec<Tile>], cells_w: usize, cells_h: usize, rng: &mut impl Rng) {
